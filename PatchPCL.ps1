@@ -47,6 +47,33 @@ function Get-MethodDef($Type, [string]$Name, [int]$ParamCount) {
     return $ms[0]
 }
 
+function Get-ConstantFieldValue($Type, [string]$Name) {
+    $fs = @($Type.Fields | Where-Object { $_.Name -eq $Name -and $_.HasConstant })
+    if ($fs.Count -ne 1) { return $null }
+    return $fs[0].Constant
+}
+
+function Get-PclBuildInfo($Asm) {
+    $mb = $Asm.MainModule.GetType('PCL.ModBase')
+    if ($null -eq $mb) { throw '找不到 PCL.ModBase，目标可能不是 PCL 程序集' }
+    $bt = Get-ConstantFieldValue $mb 'BuildType'
+    $vc = Get-ConstantFieldValue $mb 'VersionCode'
+    $vd = Get-ConstantFieldValue $mb 'VersionDisplay'
+    $btInt = if ($null -ne $bt) { [int]$bt } else { -1 }
+    switch ($btInt) {
+        50 { $kind = '正式版' }
+        0  { $kind = '快照版' }
+        100 { $kind = '开发版' }
+        default { $kind = '未知版本' }
+    }
+    return [pscustomobject]@{
+        Kind           = $kind
+        BuildType      = $btInt
+        VersionCode    = if ($null -ne $vc) { [int]$vc } else { 0 }
+        VersionDisplay = [string]$vd
+    }
+}
+
 function Find-MemberRef($Asm, [string]$Name, [string]$DeclaringTypeFullName, [int]$ParamCount = -1) {
     $refs = @($Asm.MainModule.GetMemberReferences() | Where-Object {
         $_.Name -eq $Name -and
@@ -410,6 +437,14 @@ $probeAsm.Dispose()
 
 $resolver = New-Resolver $depsDir
 $asm = Read-AssemblyWithResolver $InputExe $resolver
+
+$build = Get-PclBuildInfo $asm
+Write-Host ("检测到：{0}（BuildType={1}, VersionCode={2}）" -f $build.VersionDisplay, $build.BuildType, $build.VersionCode)
+if ($build.Kind -eq '未知版本') {
+    Write-Host '  [警告] 未识别的 BuildType，将按相同限制点尝试打补丁。' -ForegroundColor Yellow
+} else {
+    Write-Host ("  [OK] 分支：{0}，下载限制点与正式版一致，继续打补丁" -f $build.Kind)
+}
 
 Write-Host '开始打补丁：'
 Patch-LoaderInit $asm
