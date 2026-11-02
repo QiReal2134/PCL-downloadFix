@@ -13,15 +13,17 @@ if ([string]::IsNullOrEmpty($OutputExe)) { $OutputExe = Join-Path $scriptDir 'ou
 $cecilPath = @(
     (Join-Path $scriptDir 'lib\Mono.Cecil.dll'),
     (Join-Path (Split-Path $scriptDir -Parent) 'PCL-main\pcl-patch\lib\Mono.Cecil.dll'),
-    (Join-Path (Split-Path $scriptDir -Parent) 'pcl-patch\lib\Mono.Cecil.dll')
-) | Where-Object { Test-Path $_ } | Select-Object -First 1
-if (-not $cecilPath) { throw "缺少 lib\Mono.Cecil.dll。请把补丁包中的 lib 文件夹一起复制到 $scriptDir\lib（只复制 PatchPCL.ps1 无法运行）。" }
+    (Join-Path (Split-Path $scriptDir -Parent) 'pcl-patch\lib\Mono.Cecil.dll'),
+    (Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\2022\BuildTools\Common7\IDE\Extensions\TestPlatform\Extensions\Mono.Cecil.dll')
+) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if (-not $cecilPath) { throw "缺少 lib\Mono.Cecil.dll。请把补丁包中的 lib 文件夹复制到 $scriptDir\lib。" }
 if (-not ('Mono.Cecil.AssemblyDefinition' -as [type])) {
     Add-Type -Path $cecilPath
 }
 Add-Type -AssemblyName System.Resources.ResourceManager | Out-Null
 
-$restrictMessage = '为遵守相关法律法规，PCL 暂时不再提供 MC 下载功能，非常抱歉 qwq……'
+# 限制提示在不同版本间文字有差异（“暂时不再提供” / “不再提供”），按特征匹配
+$restrictMessageLike = '*遵守相关法律法规*MC 下载功能*'
 $tempRoot = Join-Path $env:TEMP ('pcl-unlock-' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tempRoot | Out-Null
 
@@ -62,14 +64,14 @@ function Get-PclBuildInfo($Asm) {
     $btInt = if ($null -ne $bt) { [int]$bt } else { -1 }
     switch ($btInt) {
         50 { $kind = '正式版' }
-        0  { $kind = '快照版' }
+        0 { $kind = '快照版' }
         100 { $kind = '开发版' }
         default { $kind = '未知版本' }
     }
     return [pscustomobject]@{
-        Kind           = $kind
-        BuildType      = $btInt
-        VersionCode    = if ($null -ne $vc) { [int]$vc } else { 0 }
+        Kind = $kind
+        BuildType = $btInt
+        VersionCode = if ($null -ne $vc) { [int]$vc } else { 0 }
         VersionDisplay = [string]$vd
     }
 }
@@ -153,6 +155,76 @@ function Patch-LoaderInit($Asm) {
     Write-Host '  [OK] PageDownloadInstall.LoaderInit -> DlClientListLoader'
 }
 
+# ---------- 1b. 下载页左侧“原版游戏”入口：恢复可见并默认选中 ----------
+function Patch-DownloadLeft($Asm) {
+    $t = Get-TypeDef $Asm 'PCL.PageDownloadLeft'
+    $m = Get-MethodDef $t '.ctor' 0
+    $ins = $m.Body.Instructions
+
+    function Set-DownloadItemVisible([string]$Getter) {
+        for ($i = 2; $i -lt $ins.Count; $i++) {
+            $call = $ins[$i].Operand
+            if ($ins[$i].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Callvirt -and
+                $call -is [Mono.Cecil.MethodReference] -and $call.Name -eq 'set_Visibility') {
+                $ldc = $ins[$i - 1]
+                $get = $ins[$i - 2].Operand
+                if ($ldc.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldc_I4_2 -and
+                    $get -is [Mono.Cecil.MethodReference] -and $get.Name -eq $Getter) {
+                    $ldc.OpCode = [Mono.Cecil.Cil.OpCodes]::Ldc_I4_0
+                    return $true
+                }
+            }
+        }
+        return $false
+    }
+    if (-not (Set-DownloadItemVisible 'get_ItemInstall')) { throw 'PageDownloadLeft..ctor：找不到 ItemInstall 的隐藏代码' }
+    if (-not (Set-DownloadItemVisible 'get_LabResource')) { throw 'PageDownloadLeft..ctor：找不到 LabResource 的隐藏代码' }
+
+    # 默认页从 DownloadMod(2) 改回 DownloadInstall(0)
+    $found = $false
+    for ($i = 2; $i -lt $ins.Count; $i++) {
+        $op = $ins[$i].Operand
+        if ($ins[$i].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Stfld -and
+            $op -is [Mono.Cecil.FieldReference] -and $op.Name -eq 'PageID' -and
+            $ins[$i - 1].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldc_I4_2) {
+            $ins[$i - 1].OpCode = [Mono.Cecil.Cil.OpCodes]::Ldc_I4_0
+            $found = $true
+            break
+        }
+    }
+    if (-not $found) { throw 'PageDownloadLeft..ctor：找不到 PageID = 2' }
+
+    # ItemMod.Checked = true -> false，并补上 ItemInstall.Checked = true
+    $found = $false
+    $setCheckedRef = $null
+    for ($i = 2; $i -lt $ins.Count; $i++) {
+        $op = $ins[$i].Operand
+        if ($ins[$i].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Callvirt -and
+            $op -is [Mono.Cecil.MethodReference] -and $op.Name -eq 'set_Checked' -and
+            $ins[$i - 1].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldc_I4_1) {
+            $get = $ins[$i - 2].Operand
+            if ($get -is [Mono.Cecil.MethodReference] -and $get.Name -eq 'get_ItemMod') {
+                $ins[$i - 1].OpCode = [Mono.Cecil.Cil.OpCodes]::Ldc_I4_0
+                $setCheckedRef = $op
+                $found = $true
+                break
+            }
+        }
+    }
+    if (-not $found) { throw 'PageDownloadLeft..ctor：找不到 ItemMod.Checked = true' }
+
+    $getItemInstallRef = Get-MethodDef $t 'get_ItemInstall' 0
+    $insertAt = $i + 1
+    $newIns = @(
+        (New-I ([Mono.Cecil.Cil.OpCodes]::Ldarg_0)),
+        (New-I ([Mono.Cecil.Cil.OpCodes]::Callvirt) $getItemInstallRef),
+        (New-I ([Mono.Cecil.Cil.OpCodes]::Ldc_I4_1)),
+        (New-I ([Mono.Cecil.Cil.OpCodes]::Callvirt) $setCheckedRef)
+    )
+    foreach ($x in $newIns) { $ins.Insert($insertAt, $x); $insertAt++ }
+    Write-Host '  [OK] PageDownloadLeft..ctor -> 原版游戏入口可见，默认进入安装页'
+}
+
 # ---------- 2. 版本修改页：基础版本卡片改为可见 ----------
 function Patch-LoadInstanceFinished($Asm) {
     $t = Get-TypeDef $Asm 'PCL.PageDownloadModify'
@@ -192,6 +264,14 @@ function Patch-ResourceDetail($Asm) {
     if (-not ($ctorRef -is [Mono.Cecil.MethodReference])) { throw 'InitializeStackResourceVersions：找不到 ClickEventHandler 构造' }
     if ($ins[$k + 2].OpCode -ne [Mono.Cecil.Cil.OpCodes]::Ldnull) { throw 'InitializeStackResourceVersions：预期 ldnull 位置不符' }
 
+    # 第二个回调是 MyIconButton.ClickEventHandler，不能复用第一个 MyListItem.ClickEventHandler 的构造器
+    $iconButtonType = Get-TypeDef $Asm 'PCL.MyIconButton'
+    $iconHandlerType = @($iconButtonType.NestedTypes | Where-Object { $_.Name -eq 'ClickEventHandler' })
+    if ($iconHandlerType.Count -ne 1) { throw '找不到 MyIconButton/ClickEventHandler' }
+    $iconCtor = @($iconHandlerType[0].Methods | Where-Object { $_.Name -eq '.ctor' -and $_.Parameters.Count -eq 2 })
+    if ($iconCtor.Count -ne 1) { throw '找不到 MyIconButton/ClickEventHandler 构造器' }
+    $iconCtorRef = $iconCtor[0]
+
     $targetField = @($t.Fields | Where-Object { $_.Name -eq 'TargetResourceType' })
     if ($targetField.Count -ne 1) { throw 'InitializeStackResourceVersions：找不到 TargetResourceType 字段' }
 
@@ -201,9 +281,9 @@ function Patch-ResourceDetail($Asm) {
     # 删除原有的两个 handler 构造（ldarg.0, ldftn Save_Click, newobj, ldnull）
     for ($i = 0; $i -lt 4; $i++) { $ins.RemoveAt($k - 1) }
 
-    # 恢复原条件：仅当 TargetResourceType = ModPack(2) 时才挂安装回调，其余资源仍只挂保存回调
-    $saveOnlyLabel = New-I ([Mono.Cecil.Cil.OpCodes]::Ldnull)
-    $afterLabel = New-I ([Mono.Cecil.Cil.OpCodes]::Ldarg_0)
+    # 恢复原条件：ModPack 用 Install_Click + Save_Click；其他资源保持 Save_Click + null
+    $saveOnlyLabel = New-I ([Mono.Cecil.Cil.OpCodes]::Nop)
+    $afterLabel = New-I ([Mono.Cecil.Cil.OpCodes]::Nop)
     $block = @(
         (New-I ([Mono.Cecil.Cil.OpCodes]::Ldarg_0)),
         (New-I ([Mono.Cecil.Cil.OpCodes]::Ldfld) $targetField[0]),
@@ -212,11 +292,16 @@ function Patch-ResourceDetail($Asm) {
         (New-I ([Mono.Cecil.Cil.OpCodes]::Ldarg_0)),
         (New-I ([Mono.Cecil.Cil.OpCodes]::Ldftn) $installDef),
         (New-I ([Mono.Cecil.Cil.OpCodes]::Newobj) $ctorRef),
+        (New-I ([Mono.Cecil.Cil.OpCodes]::Ldarg_0)),
+        (New-I ([Mono.Cecil.Cil.OpCodes]::Ldftn) $saveDef),
+        (New-I ([Mono.Cecil.Cil.OpCodes]::Newobj) $iconCtorRef),
         (New-I ([Mono.Cecil.Cil.OpCodes]::Br) $afterLabel),
         $saveOnlyLabel,
-        $afterLabel,
+        (New-I ([Mono.Cecil.Cil.OpCodes]::Ldarg_0)),
         (New-I ([Mono.Cecil.Cil.OpCodes]::Ldftn) $saveDef),
-        (New-I ([Mono.Cecil.Cil.OpCodes]::Newobj) $ctorRef)
+        (New-I ([Mono.Cecil.Cil.OpCodes]::Newobj) $ctorRef),
+        (New-I ([Mono.Cecil.Cil.OpCodes]::Ldnull)),
+        $afterLabel
     )
     $insertAt = $k - 1
     foreach ($x in $block) { $ins.Insert($insertAt, $x); $insertAt++ }
@@ -233,7 +318,7 @@ function Patch-ModpackInstallFile($Asm) {
 
     $anchor = -1
     for ($i = 0; $i -lt $ins.Count; $i++) {
-        if ($ins[$i].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldstr -and $ins[$i].Operand -eq $restrictMessage) { $anchor = $i; break }
+        if ($ins[$i].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldstr -and $ins[$i].Operand -like $restrictMessageLike) { $anchor = $i; break }
     }
     if ($anchor -lt 0) { throw 'ModpackInstall(3)：找不到限制提示字符串' }
     if ($ins[$anchor + 1].OpCode -ne [Mono.Cecil.Cil.OpCodes]::Newobj -or
@@ -425,7 +510,15 @@ if (-not $InputExe) {
 if (-not (Test-Path $InputExe)) { throw "找不到输入 exe：$InputExe" }
 $outputDir = Split-Path $OutputExe -Parent
 if (-not (Test-Path $outputDir)) { New-Item -ItemType Directory -Path $outputDir | Out-Null }
-if (Test-Path $OutputExe) { Remove-Item -Force $OutputExe }
+if (Test-Path $OutputExe) {
+    try {
+        Remove-Item -Force $OutputExe
+    } catch {
+        $altName = 'Plain Craft Launcher 2 (' + (Get-Date -Format 'HHmmss') + ').exe'
+        $OutputExe = Join-Path $outputDir $altName
+        Write-Host "原输出文件被占用（可能 PCL 正在运行），已改写到：$OutputExe" -ForegroundColor Yellow
+    }
+}
 
 Write-Host "输入：$InputExe"
 Write-Host "输出：$OutputExe"
@@ -447,6 +540,7 @@ if ($build.Kind -eq '未知版本') {
 }
 
 Write-Host '开始打补丁：'
+Patch-DownloadLeft $asm
 Patch-LoaderInit $asm
 Patch-LoadInstanceFinished $asm
 Patch-ResourceDetail $asm
@@ -467,6 +561,38 @@ function Check($Condition, [string]$Message) {
     if (-not $Condition) { $script:checkErrors.Add($Message) }
 }
 
+$dl = Get-MethodDef (Get-TypeDef $v 'PCL.PageDownloadLeft') '.ctor' 0
+$dlIns = $dl.Body.Instructions
+$installVisibleOk = $false
+$labVisibleOk = $false
+$itemModUncheckedOk = $true
+$itemInstallCheckedOk = $false
+for ($i = 2; $i -lt $dlIns.Count; $i++) {
+    $op = $dlIns[$i].Operand
+    if ($dlIns[$i].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Callvirt -and $op -is [Mono.Cecil.MethodReference] -and $op.Name -eq 'set_Visibility') {
+        $get = $dlIns[$i - 2].Operand
+        if ($get -is [Mono.Cecil.MethodReference] -and $dlIns[$i - 1].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldc_I4_0) {
+            if ($get.Name -eq 'get_ItemInstall') { $installVisibleOk = $true }
+            if ($get.Name -eq 'get_LabResource') { $labVisibleOk = $true }
+        }
+    }
+    if ($dlIns[$i].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Callvirt -and $op -is [Mono.Cecil.MethodReference] -and $op.Name -eq 'set_Checked') {
+        $get = $dlIns[$i - 2].Operand
+        if ($get -is [Mono.Cecil.MethodReference] -and $get.Name -eq 'get_ItemMod' -and $dlIns[$i - 1].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldc_I4_1) { $itemModUncheckedOk = $false }
+        if ($get -is [Mono.Cecil.MethodReference] -and $get.Name -eq 'get_ItemInstall' -and $dlIns[$i - 1].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldc_I4_1) { $itemInstallCheckedOk = $true }
+    }
+}
+Check -Condition $installVisibleOk -Message 'PageDownloadLeft：原版游戏入口仍被隐藏'
+Check -Condition $labVisibleOk -Message 'PageDownloadLeft：社区资源标签仍被隐藏'
+Check -Condition $itemModUncheckedOk -Message 'PageDownloadLeft：默认仍选中 Mod'
+Check -Condition $itemInstallCheckedOk -Message 'PageDownloadLeft：原版游戏未设为默认选中'
+$pageIdBad = $false
+for ($i = 2; $i -lt $dlIns.Count; $i++) {
+    $op = $dlIns[$i].Operand
+    if ($dlIns[$i].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Stfld -and $op -is [Mono.Cecil.FieldReference] -and $op.Name -eq 'PageID' -and $dlIns[$i - 1].OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldc_I4_2) { $pageIdBad = $true }
+}
+Check -Condition (-not $pageIdBad) -Message 'PageDownloadLeft：PageID 仍指向 Mod 页'
+
 $li = Get-MethodDef (Get-TypeDef $v 'PCL.PageDownloadInstall') 'LoaderInit' 0
 $liText = @($li.Body.Instructions | ForEach-Object { if ($_.Operand -is [Mono.Cecil.FieldReference]) { $_.Operand.Name } else { '' } })
 Check -Condition (-not ($li.Body.Instructions | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldstr -and $_.Operand -eq '关闭下载' })) -Message 'LoaderInit 仍包含关闭下载'
@@ -485,17 +611,20 @@ Check -Condition $cardOk -Message 'CardMinecraft 未设为可见'
 $rd = Get-MethodDef (Get-TypeDef $v 'PCL.PageDownloadResourceDetail') 'InitializeStackResourceVersions' 1
 Check -Condition ($rd.Body.Instructions | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldftn -and $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -eq 'Install_Click' }) -Message '资源详情未恢复 Install_Click'
 Check -Condition ($rd.Body.Instructions | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldftn -and $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -eq 'Save_Click' }) -Message '资源详情未保留 Save_Click'
+$rdNewobjs = @($rd.Body.Instructions | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Newobj -and $_.Operand -is [Mono.Cecil.MethodReference] } | ForEach-Object { $_.Operand })
+Check -Condition ($rdNewobjs | Where-Object { $_.DeclaringType -and $_.DeclaringType.FullName -eq 'PCL.MyListItem/ClickEventHandler' }) -Message '资源详情缺少 MyListItem 点击回调'
+Check -Condition ($rdNewobjs | Where-Object { $_.DeclaringType -and $_.DeclaringType.FullName -eq 'PCL.MyIconButton/ClickEventHandler' }) -Message '资源详情缺少 MyIconButton 保存回调（类型必须正确）'
 
 $mi3 = Get-MethodDef (Get-TypeDef $v 'PCL.ModModpack') 'ModpackInstall' 3
 $mi3Ins = $mi3.Body.Instructions
-Check -Condition (-not ($mi3Ins | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldstr -and $_.Operand -eq $restrictMessage })) -Message 'ModpackInstall(3) 仍含限制提示'
+Check -Condition (-not ($mi3Ins | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldstr -and $_.Operand -like $restrictMessageLike })) -Message 'ModpackInstall(3) 仍含限制提示'
 $installTargets = @('InstallPackCurseForge', 'InstallPackModrinth', 'InstallPackHMCL', 'InstallPackMMC', 'InstallPackMCBBS', 'InstallPackLauncherPack', 'InstallPackCompress')
 foreach ($n in $installTargets) {
     Check -Condition ($mi3Ins | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Call -and $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -eq $n }) -Message "ModpackInstall(3) 缺少 $n 调用"
 }
 Check -Condition ($mi3Ins | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Switch }) -Message 'ModpackInstall(3) 缺少 switch'
 $mi0 = Get-MethodDef (Get-TypeDef $v 'PCL.ModModpack') 'ModpackInstall' 0
-Check -Condition (-not ($mi0.Body.Instructions | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldstr -and $_.Operand -eq $restrictMessage })) -Message 'ModpackInstall(0) 仍含限制提示'
+Check -Condition (-not ($mi0.Body.Instructions | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Ldstr -and $_.Operand -like $restrictMessageLike })) -Message 'ModpackInstall(0) 仍含限制提示'
 Check -Condition ($mi0.Body.Instructions | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Call -and $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -eq 'SelectFile' }) -Message 'ModpackInstall(0) 缺少 SelectFile'
 Check -Condition ($mi0.Body.Instructions | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Call -and $_.Operand -is [Mono.Cecil.MethodReference] -and $_.Operand.Name -eq 'RunInThread' }) -Message 'ModpackInstall(0) 缺少 RunInThread'
 Check -Condition ($mi0.Body.Instructions | Where-Object { $_.OpCode -eq [Mono.Cecil.Cil.OpCodes]::Stfld -and $_.Operand -is [Mono.Cecil.FieldReference] -and $_.Operand.Name -eq '$VB$Local_File' }) -Message 'ModpackInstall(0) 缺少闭包字段写入'
